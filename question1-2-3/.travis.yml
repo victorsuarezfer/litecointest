@@ -1,0 +1,50 @@
+---
+language: ruby
+os: linux
+dist: focal
+services:
+  - docker
+
+# Steps to install kubectl from https://caveofcode.com/continuous-delivery-to-kubernetes-with-travis-ci/
+install:
+  - curl -LO "https://storage.googleapis.com/kubernetes-release/release/$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)/bin/linux/amd64/kubectl"
+  - sudo mv ./kubectl /usr/local/bin/kubectl
+  - mkdir ${HOME}/.kube
+  # Set kubeconfig of our cluster as a travis secret. (Using other secure providers would be a better idea. Example: Hashicorp Vault)
+  - echo "$KUBE_CONFIG" | base64 --decode > ${HOME}/.kube/config
+env:
+  jobs:
+    # Useful if needed to build/deploy images of different versions.
+    #   if so, we'll need to reconsider the deploy stage.
+    - LITECOIN_VERSION=0.18.1
+jobs:
+  include:
+    - stage: image_build
+      script:
+        - docker build --build-arg ltc_version=$LITECOIN_VERSION --tag ltc:$LITECOIN_VERSION .
+        - docker run -it --rm vicsufer/ltc:$LITECOIN_VERSION ./litecoind --version
+    - stage: image_test
+      script:
+        # Very simple check for time reassons, but it will be a nice idea to use Anchore or other security tools 
+        #   to validate the image at this stage.
+        - docker run -it --rm vicsufer/ltc:$LITECOIN_VERSION ./litecoind --version | grep $LITECOIN_VERSION
+    - stage: image_publish
+      script:
+        - echo "DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+        # Tag the image with the commit that trigger its build, this will make it easy to trace back bugs/errors 
+        #   if something goes wrong after beign deployed.
+        - docker tag ltc vicsufer/ltc:$LITECOIN_VERSION-$TRAVIS_COMMIT
+        - docker tag ltc vicsufer/ltc:$LITECOIN_VERSION-latest
+        - docker push vicsufer/ltc:$LITECOIN_VERSION-$TRAVIS_COMMIT
+        - docker push vicsufer/ltc:$LITECOIN_VERSION-latest
+    - stage: deploy
+      script: skip
+      deploy:
+        provider: script
+        # This need to be a one-liner due to travis deployer-script limitation and to avoid using an aditional script file.
+        # First dry-run the manifest in order to detect simple error, and that it is compatible with the k8s cluster version
+        #    "kubctl diff" could also be used to check for differences between live object and to be generated one.
+        # If previous checks are OK, the command is run without the --dry-run flag.
+        script: kubectl set image statefulset/ltc-node ltc-node=vicsufer/ltc:$LITECOIN_VERSION-$TRAVIS_COMMIT --dry-run=server && kubectl set image statefulset/ltc-node ltc-node=vicsufer/ltc:$LITECOIN_VERSION-$TRAVIS_COMMIT --dry-run=client
+        on:
+          branch: main # Only deploy if build is for main branch.
